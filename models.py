@@ -13,7 +13,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from timm.models.vision_transformer import PatchEmbed, Mlp, Attention
+
+
 
 
 def modulate(x, shift, scale):
@@ -122,7 +124,7 @@ class DiTBlock(nn.Module):
         hidden_size,
         num_heads,
         mlp_ratio=4.0,
-        enable_flashattn=True,
+        enable_flashattn=False,
         **block_kwargs,
     ):
         super().__init__()
@@ -214,7 +216,13 @@ class DiT(nn.Module):
             input_size, patch_size, in_channels, hidden_size, bias=True
         )
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        # self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        # self.y_embedder = PatchEmbed3D(
+        #    (2, 4, 4), in_channels, hidden_size, bias=True
+        # )
+        self.y_embedder = PatchEmbed(
+           input_size, patch_size, in_channels, hidden_size, bias=True
+        )
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(
@@ -223,7 +231,7 @@ class DiT(nn.Module):
 
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio)
+                DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, enable_flashattn=enable_flashattn)
                 for _ in range(depth)
             ]
         )
@@ -258,7 +266,10 @@ class DiT(nn.Module):
         nn.init.constant_(self.x_embedder.proj.bias, 0)
 
         # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.y_embedder.proj.bias, 0)
+        # nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -293,17 +304,21 @@ class DiT(nn.Module):
     def forward(self, x, t, y):
         """
         Forward pass of DiT.
-        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
+        x: (B, C, H, W) tensor of spatial inputs (images or latent representations of images)
+        t: (B,) tensor of diffusion timesteps
+        y: (B,) tensor of class labels (model output)
         """
         x = x.to(self.dtype)
+        y = y.to(self.dtype)
         x = (
             self.x_embedder(x) + self.pos_embed
         )  # (N, T, D), where T = H * W / patch_size ** 2
-        t = self.t_embedder(t, dtype=x.dtype)  # (N, D)
-        y = self.y_embedder(y, self.training)  # (N, D)
-        c = t + y  # (N, D)
+        y = (self.y_embedder(y) + self.pos_embed)  # (N, D)
+        t = self.t_embedder(t, dtype=x.dtype) 
+        t = torch.swapaxes(t.repeat(y.shape[1], 1, 1), 0, 1) # (N, T, D)
+        
+        
+        c = t + y  # (N, T, D)
         for block in self.blocks:
             x = block(x, c)  # (N, T, D)
         x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)

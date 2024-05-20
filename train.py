@@ -17,7 +17,7 @@ torch.backends.cudnn.allow_tf32 = True
 from torch.utils.data import DataLoader
 
 # from torch.utils.data.distributed import DistributedSampler
-from torchvision.datasets import ImageFolder
+from data.datasets import NoisyBSDSDataset
 from torchvision import transforms
 import numpy as np
 from collections import OrderedDict
@@ -86,29 +86,6 @@ def create_logger(logging_dir):
     #     logger = logging.getLogger(__name__)
     #     logger.addHandler(logging.NullHandler())
     return logger
-
-
-def center_crop_arr(pil_image, image_size):
-    """
-    Center cropping implementation from ADM.
-    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
-    """
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(
-        arr[crop_y : crop_y + image_size, crop_x : crop_x + image_size]
-    )
 
 
 #################################################################################
@@ -182,27 +159,15 @@ def main(args):
         if os.path.isfile(args.resume):
             print(f"=> loading checkpoint '{args.resume}'")
             checkpoint = torch.load(args.resume)
-            model.load_state_dict(checkpoint['model'])
-            opt.load_state_dict(checkpoint['opt'])
-            ema.load_state_dict(checkpoint['ema'])
+            model.load_state_dict(checkpoint["model"])
+            opt.load_state_dict(checkpoint["opt"])
+            ema.load_state_dict(checkpoint["ema"])
             print(f"=> loaded checkpoint '{args.resume}'")
         else:
             print(f"=> no checkpoint found at '{args.resume}'")
 
     # Setup data:
-    transform = transforms.Compose(
-        [
-            transforms.Lambda(
-                lambda pil_image: center_crop_arr(pil_image, args.image_size)
-            ),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True
-            ),
-        ]
-    )
-    dataset = ImageFolder(args.data_path, transform=transform)
+    dataset = NoisyBSDSDataset(args.data_path, image_size=args.image_size, sigma=30)
     loader = DataLoader(
         dataset,
         batch_size=int(args.global_batch_size),
@@ -235,6 +200,8 @@ def main(args):
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x.to(dtype)
+                y.to(dtype)
+                y = vae.encode(y).latent_dist.sample().mul_(0.18215)
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
@@ -287,7 +254,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument(
-        "--model", type=str, choices=list(DiT_models.keys()), default="DiT-S/2"
+        "--model", type=str, choices=list(DiT_models.keys()), default="DiT-S/8"
     )
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
@@ -304,9 +271,14 @@ if __name__ == "__main__":
         "--enable_flashattn", default=True, help="Enable flashattn kernel"
     )
     parser.add_argument(
-        "--mixed-precision", type=str, choices=["bf16", "fp16", "fp32"], default="bf16"
+        "--mixed-precision", type=str, choices=["bf16", "fp16", "fp32"], default="fp16"
     )
-    
-    parser.add_argument("--resume", type=str, default=None, help="Path to .pt file to resume training from")
+
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to .pt file to resume training from",
+    )
     args = parser.parse_args()
     main(args)
